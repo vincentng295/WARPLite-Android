@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [ "**" ]
+    tags: [ "v*" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell:
+    name: Shell script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: shellcheck build.sh
+        run: shellcheck --severity=warning build.sh
+
+  test:
+    name: Host tests (X25519, WireGuard URI, overrides)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run tests
+        run: bash build.sh --test
+
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    needs: [shell, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The runner image ships an Android SDK and exports ANDROID_HOME; fail early if that changes.
+      - name: Check Android SDK
+        run: |
+          [ -d "${ANDROID_HOME:-}/platforms" ] || { echo "::error::Android SDK not found on runner"; exit 1; }
+          echo "SDK: $ANDROID_HOME"
+
+      # The project has no Gradle wrapper; AGP 8.5 needs Gradle 8.7+. setup-gradle also caches ~/.gradle
+      # (only main writes the cache, other branches and PRs read it).
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      # Secrets only hold text. The secret M2VR_KEYSTORE_ENV holds the whole contents of a M2VR_KEYSTORE.env file
+      # (see M2VR_KEYSTORE.env.example); it is written to that file, parsed (never `source`d), and the
+      # variables in it take priority. The EX_* secrets are only the fallback for anything the file leaves empty.
+      # With neither (forks, pull requests) the APK is signed with the debug key instead.
+      - name: Prepare keystore
+        env:
+          M2VR_KEYSTORE_ENV: ${{ secrets.M2VR_KEYSTORE_ENV }}
+          EX_KEYSTORE_BASE64: ${{ secrets.EX_KEYSTORE_BASE64 }}
+          EX_KEYSTORE_PASSWORD: ${{ secrets.EX_KEYSTORE_PASSWORD }}
+          EX_KEY_ALIAS: ${{ secrets.EX_KEY_ALIAS }}
+          EX_KEY_PASSWORD: ${{ secrets.EX_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ENV_FILE="$GITHUB_WORKSPACE/M2VR_KEYSTORE.env"
+          MV_KEYSTORE_BASE64="" MV_KEYSTORE_PASSWORD="" MV_KEY_ALIAS="" MV_KEY_PASSWORD=""
+
+          if [ -n "$M2VR_KEYSTORE_ENV" ]; then
+            umask 077
+            printf '%s\n' "$M2VR_KEYSTORE_ENV" > "$ENV_FILE"
+            echo "created M2VR_KEYSTORE.env from the M2VR_KEYSTORE_ENV secret"
+            while IFS= read -r line || [ -n "$line" ]; do
+              line=${line%$'\r'}
+              case "$line" in ''|'#'*) continue ;; esac
+              line=${line#export }
+              key=${line%%=*}
+              val=${line#*=}
+              val=${val#\"}; val=${val%\"}
+              val=${val#\'}; val=${val%\'}
+              case "$key" in
+                MV_KEYSTORE_BASE64|MV_KEYSTORE_PASSWORD|MV_KEY_ALIAS|MV_KEY_PASSWORD) printf -v "$key" '%s' "$val" ;;
+              esac
+            done < "$ENV_FILE"
+          fi
+
+          # M2VR_KEYSTORE.env first, EX_* secrets second
+          KS_B64=${MV_KEYSTORE_BASE64:-$EX_KEYSTORE_BASE64}
+          KS_PASS=${MV_KEYSTORE_PASSWORD:-$EX_KEYSTORE_PASSWORD}
+          KEY_ALIAS=${MV_KEY_ALIAS:-$EX_KEY_ALIAS}
+          KEY_PASS=${MV_KEY_PASSWORD:-$EX_KEY_PASSWORD}
+
+          if [ -z "$KS_B64" ]; then
+            echo "no keystore (M2VR_KEYSTORE_ENV / EX_KEYSTORE_BASE64): building with the debug key"
+            exit 0
+          fi
+
+          for v in "$KS_B64" "$KS_PASS" "$KEY_ALIAS" "$KEY_PASS"; do
+            [ -n "$v" ] && echo "::add-mask::$v"
+          done
+          printf '%s' "$KS_B64" | tr -d ' \r\n' | base64 -d > "$RUNNER_TEMP/release.jks"
+
+          {
+            echo "EX_KEYSTORE=$RUNNER_TEMP/release.jks"
+            echo "EX_KEYSTORE_PASSWORD=$KS_PASS"
+            echo "EX_KEY_ALIAS=$KEY_ALIAS"
+            echo "EX_KEY_PASSWORD=$KEY_PASS"
+          } >> "$GITHUB_ENV"
+
+      # --test already ran in the previous job, so go straight to the APK.
+      # EX_KEYSTORE* come from "Prepare keystore" via GITHUB_ENV (a step-level env: would override them).
+      - name: Build
+        run: bash build.sh
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks" "$GITHUB_WORKSPACE/M2VR_KEYSTORE.env"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: warp-lite
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: warp-lite
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.apk

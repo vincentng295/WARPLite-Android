@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+dist/
+M2VR_KEYSTORE.env
+*.jks
