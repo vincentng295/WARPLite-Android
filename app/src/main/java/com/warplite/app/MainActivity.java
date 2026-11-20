@@ -49,7 +49,7 @@ public class MainActivity extends Activity {
 
     static final String SESSION_NAME = "1.1.1.1 WARP";
     private static final String HELP_URL = "https://github.com/vincentng295/WARPLite-Android";
-    private static final String MAGIC_URL = "https://github.com/vincentng295/Magic_V2Ray";
+    private static final String MAGIC_URL = "https://magicv2ray.vercel.app";
 
     private enum State { OFF, CONNECTING, ON }
 
@@ -80,6 +80,8 @@ public class MainActivity extends Activity {
         stack.add("home");
         applyTheme();
         render();
+        // fresh launch only (not after a rotation): ask for Magic V2Ray right away if it is missing
+        if (b == null && !MagicV2Ray.available(this)) ui.post(this::promptInstallMagic);
     }
 
     @Override
@@ -161,12 +163,7 @@ public class MainActivity extends Activity {
             return;
         }
         if (!MagicV2Ray.available(this)) {
-            new AlertDialog.Builder(this)
-                    .setTitle("Magic V2Ray needed")
-                    .setMessage("This app hands its configuration to Magic V2Ray, which creates the VPN. "
-                            + "Install a version with the connect API first.")
-                    .setPositiveButton("Open GitHub", (d, w) -> open(MAGIC_URL))
-                    .setNegativeButton("Cancel", null).show();
+            promptInstallMagic();
             return;
         }
         error = null;
@@ -176,6 +173,18 @@ public class MainActivity extends Activity {
         Log.add("mode " + (settings.mode == WarpOverrides.MODE_WARP ? "WARP" : "1.1.1.1") + ", overrides " + overrides);
         if (settings.mode == WarpOverrides.MODE_1111) connectBridge(overrides);
         else connectWarp(overrides);
+    }
+
+    /** Magic V2Ray (or a version with the connect API) is missing: ask the user to download it from MAGIC_URL. */
+    private void promptInstallMagic() {
+        if (isFinishing()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("Magic V2Ray needed")
+                .setMessage("This app hands its configuration to Magic V2Ray, which creates the VPN. "
+                        + "Download and install Magic V2Ray (a version with the connect API) from "
+                        + MAGIC_URL + " first.")
+                .setPositiveButton("Download", (d, w) -> open(MAGIC_URL))
+                .setNegativeButton("Later", null).show();
     }
 
     /** 1.1.1.1: start the DNS bridge, wait until its port is really open, then connect Magic V2Ray to it. */

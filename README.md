@@ -4,6 +4,8 @@ Source: https://github.com/vincentng295/WARPLite-Android
 
 Android app that gets a free WARP WireGuard config and hands it to **Magic V2Ray** through its connect API. The app itself creates no VPN.
 
+**Requires Magic V2Ray.** If it is not installed, the app asks you to download it from https://magicv2ray.vercel.app (on launch and when you switch the toggle on).
+
 ```
 toggle ON -> WarpClient.register()  (POST api.cloudflareclient.com/v0a2158/reg, X25519 key made on the phone)
           -> wireguard://<priv>@engage.cloudflareclient.com:2408?address=..&publickey=..&mtu=1280&reserved=a,b,c
