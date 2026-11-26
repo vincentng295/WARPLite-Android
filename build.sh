@@ -45,7 +45,7 @@ run_tests() {
     local tmp; tmp=$(mktemp -d)
     echo "==> host tests"
     javac -Xlint:all -d "$tmp" "$pkg/X25519.java" "$pkg/Base64Lite.java" "$pkg/WarpAccount.java" \
-        "$pkg/WireGuardUri.java" "$pkg/WarpOverrides.java" "$pkg/DnsMessage.java" "$pkg/DohResolver.java" \
+        "$pkg/WireGuardUri.java" "$pkg/WarpOverrides.java" "$pkg/NodePicker.java" "$pkg/ChainUri.java" "$pkg/DnsMessage.java" "$pkg/DohResolver.java" \
         "$pkg/Socks5Server.java" tests/CoreTest.java tests/Socks5ServerTest.java
     java -cp "$tmp" com.warplite.app.CoreTest
     java -cp "$tmp" com.warplite.app.Socks5ServerTest

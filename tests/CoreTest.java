@@ -156,6 +156,34 @@ public class CoreTest {
         check(WarpOverrides.validPackage("com.huskydg.magicv2ray") && !WarpOverrides.validPackage("nodots"), "validPackage");
         check(WarpOverrides.validRoute("10.0.0.0/8") && !WarpOverrides.validRoute("10.0.0.0/33") && !WarpOverrides.validRoute("host.name"), "validRoute");
 
+
+        // ---- API level 2: node choice + chain
+        check(NodePicker.pick(false, "", "").equals(NodePicker.FREEDOM), "pick: not connected -> freedom");
+        check(NodePicker.pick(true, "direct", "freedom://localhost").equals(NodePicker.FREEDOM), "pick: direct -> freedom");
+        check(NodePicker.pick(true, "session", "vless://hidden").equals(NodePicker.FREEDOM), "pick: hidden -> freedom");
+        check(NodePicker.pick(true, "selected", "nodeid://k3x").equals("nodeid://k3x"), "pick: selected node kept");
+        check(NodePicker.chainable(true, "selected", "nodeid://k3x", "vless").equals("nodeid://k3x"), "chainable: vless node");
+        check(NodePicker.chainable(false, "selected", "nodeid://k3x", "vless") == null, "chainable: not connected -> null");
+        check(NodePicker.chainable(true, "direct", "freedom://localhost", "") == null, "chainable: no-proxy node -> null");
+        check(NodePicker.chainable(true, "selected", "nodeid://a", "wireguard") == null, "chainable: wireguard node -> null");
+        check(NodePicker.chainable(true, "selected", "nodeid://a", "chain") == null, "chainable: chain node -> null");
+        check(NodePicker.chainable(true, "session", "chain://hidden", "") == null, "chainable: hidden chain (our own session) -> null");
+        check(NodePicker.fallback(true, true, false) == null && NodePicker.fallback(true, true, true).equals(NodePicker.FREEDOM)
+                && NodePicker.fallback(false, false, false).equals(NodePicker.FREEDOM), "fallback without permission");
+        String wl = WireGuardUri.build(a, "x");
+        String ch = ChainUri.build(wl, "nodeid://k3x", true);
+        check(ch.startsWith("chain://localhost/?hopList=%5B%22wireguard%3A%2F%2F"), "chain: WARP first, JSON array url-encoded");
+        check(ch.indexOf("wireguard") < ch.indexOf("nodeid") && ch.endsWith("%22nodeid%3A%2F%2Fk3x%22%5D"), "chain: order warp, node");
+        String ch2 = ChainUri.build(wl, "nodeid://k3x", false);
+        check(ch2.indexOf("nodeid") < ch2.indexOf("wireguard"), "chain: node first when asked");
+        // 1.1.1.1 without bridge: Xray's DNS over HTTPS by IP, user routing untouched
+        WarpOverrides.Settings nb = new WarpOverrides.Settings();
+        nb.mode = WarpOverrides.MODE_1111;
+        j = WarpOverrides.json(nb, false);
+        check(balanced(j) && j.contains("\"hijackDns\":true") && j.contains("\"foreignDns\":\"https://1.1.1.1/dns-query\"")
+                && j.contains("\"dnsViaProxy\":false") && !j.contains("routing"), "1.1.1.1 level 2: hijack + DoH by IP, no routing");
+        check(WarpOverrides.json(nb).contains("\"hijackDns\":false"), "json(s) keeps the bridge variant");
+
         // ---- DNS message helpers
         byte[] q = hex("1234010000010000000000000377777707657861" + "6d706c6503636f6d0000010001");
         check(DnsMessage.describe(q, q.length).equals("www.example.com A"), "DnsMessage.describe");

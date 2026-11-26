@@ -67,6 +67,8 @@ final class WarpStore {
         s.families = sp.getInt("families", WarpOverrides.FAMILIES_NONE);
         s.dnsProtocol = sp.getInt("dnsProtocol", WarpOverrides.PROTO_WARP);
         s.fallbackResolvers = sp.getBoolean("fallback", true);
+        s.chainUserNode = sp.getBoolean("chainUserNode", true);
+        s.chainWarpFirst = sp.getBoolean("chainWarpFirstV2", false);
         readList("apps", s.excludedApps);
         readList("routes", s.excludedRoutes);
         return s;
@@ -75,6 +77,7 @@ final class WarpStore {
     void saveSettings(WarpOverrides.Settings s) {
         sp.edit().putInt("mode", s.mode).putInt("families", s.families).putInt("dnsProtocol", s.dnsProtocol)
                 .putBoolean("fallback", s.fallbackResolvers)
+                .putBoolean("chainUserNode", s.chainUserNode).putBoolean("chainWarpFirstV2", s.chainWarpFirst)
                 .putString("apps", new JSONArray(s.excludedApps).toString())
                 .putString("routes", new JSONArray(s.excludedRoutes).toString()).apply();
     }
@@ -86,6 +89,29 @@ final class WarpStore {
         } catch (JSONException ignored) {
             // empty list
         }
+    }
+
+    // ------------------------------------------------------------------ running chain
+
+    /** The user's node of the chain that is running, so the chain can be reversed after the app restarted. */
+    void saveChain(String userUri, String name, boolean warpFirst) {
+        sp.edit().putString("chainUri", userUri).putString("chainName", name).putBoolean("chainRunWarpFirst", warpFirst).apply();
+    }
+
+    void clearChain() {
+        sp.edit().remove("chainUri").remove("chainName").remove("chainRunWarpFirst").apply();
+    }
+
+    String chainUri() {
+        return sp.getString("chainUri", null);
+    }
+
+    String chainName() {
+        return sp.getString("chainName", "your node");
+    }
+
+    boolean chainWarpFirst() {
+        return sp.getBoolean("chainRunWarpFirst", false);
     }
 
     // ------------------------------------------------------------------ misc
@@ -100,7 +126,7 @@ final class WarpStore {
 
     /** "Reset all settings": everything except the account (that is "Reset security keys"). */
     void resetSettings() {
-        sp.edit().remove("mode").remove("families").remove("dnsProtocol").remove("fallback").remove("apps")
+        sp.edit().remove("mode").remove("families").remove("dnsProtocol").remove("fallback").remove("chainUserNode").remove("chainWarpFirst").remove("chainWarpFirstV2").remove("apps")
                 .remove("routes").remove("dark").remove("workerUrl").apply();
     }
 }

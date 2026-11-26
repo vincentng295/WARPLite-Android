@@ -40,16 +40,20 @@ import java.util.List;
  * 1.1.1.1 WARP Lite: one activity, nine screens drawn in code (Home, Settings, Account, Advanced, Connection
  * options, DNS settings, Excluded apps, Excluded routes, Diagnostics).
  *
- * Two modes, both end in MagicV2Ray.connectByIntent together with the temporary overrides (WarpOverrides):
- *  - WARP:    get a WireGuard config (WarpApi) -> wireguard:// link (WireGuardUri) is the node;
- *  - 1.1.1.1: start the local DNS bridge (Socks5Service / Socks5Server: any:53 -> DNS over HTTPS), node socks://127.0.0.1:5353,
- *             this app excluded from the VPN.
+ * Two modes, both end in MagicV2Ray.connectByIntent together with the temporary overrides (WarpOverrides).
+ * Magic V2Ray API level 2 tells which node is in use (getActiveNode, the user allows it once):
+ *  - WARP:    get a WireGuard config (WarpApi) -> wireguard:// link (WireGuardUri). If a node of the user is in use
+ *             (NodePicker.chainable) the node is chain://(WARP, that node) (ChainUri), else the link alone;
+ *  - 1.1.1.1: DNS only: the node in use (else freedom://localhost) with Hijack DNS + DoH, no local proxy.
+ *             Only a Magic V2Ray older than level 2 still gets the local DNS bridge (Socks5Service / Socks5Server),
+ *             node socks://127.0.0.1:5353, this app excluded from the VPN.
  */
 public class MainActivity extends Activity {
 
     static final String SESSION_NAME = "1.1.1.1 WARP";
     private static final String HELP_URL = "https://github.com/vincentng295/WARPLite-Android";
     private static final String MAGIC_URL = "https://magicv2ray.vercel.app";
+    private static final int REQ_NODE_ACCESS = 42;
 
     private enum State { OFF, CONNECTING, ON }
 
@@ -67,6 +71,9 @@ public class MainActivity extends Activity {
     private BroadcastReceiver receiver;
     private long connectingSince;
     private Ui.Toggle homeToggle;
+    private volatile String chainedWith;        // name of the user's node chained with WARP in this attempt, else null
+    private volatile String chainedUserUri;     // uri of that node, kept so the chain can be reversed while connected
+    private volatile boolean chainWarpFirst = false;   // order of the chain that is actually running
 
     // ------------------------------------------------------------------ life cycle
 
@@ -131,6 +138,11 @@ public class MainActivity extends Activity {
     private void setState(State s) {
         state = s;
         if (s != State.CONNECTING) connectingSince = 0;
+        if (s == State.OFF) {
+            chainedWith = null;
+            chainedUserUri = null;
+            store.clearChain();
+        }
         if (s == State.ON) error = null;
         if ("home".equals(top())) render();
     }
@@ -146,7 +158,10 @@ public class MainActivity extends Activity {
             magic = i;
             ui.post(() -> {
                 boolean ours = i.stateKnown && i.connected && (!i.sessionActive || SESSION_NAME.equals(i.sessionName));
-                if (ours && i.sessionActive) setState(State.ON);
+                if (ours && i.sessionActive) {
+                    if (chainedWith == null) restoreChain();
+                    setState(State.ON);
+                }
                 else if (state == State.CONNECTING && round < 12) ui.postDelayed(() -> pollState(round + 1), 2000);
                 else if (state != State.OFF && !(i.stateKnown && i.connected && !i.sessionActive)) setState(State.OFF);
                 else if ("diag".equals(top())) render();
@@ -167,12 +182,69 @@ public class MainActivity extends Activity {
             return;
         }
         error = null;
+        chainedWith = null;
         connectingSince = System.currentTimeMillis();
         setState(State.CONNECTING);
-        final String overrides = WarpOverrides.json(settings);
-        Log.add("mode " + (settings.mode == WarpOverrides.MODE_WARP ? "WARP" : "1.1.1.1") + ", overrides " + overrides);
-        if (settings.mode == WarpOverrides.MODE_1111) connectBridge(overrides);
-        else connectWarp(overrides);
+        startConnect(true);
+    }
+
+    /**
+     * Step 1: ask Magic V2Ray which node is in use (API level 2). The first time it wants the user's OK to read nodes:
+     * {@code allowAsk} lets us open that dialog once; {@link #onActivityResult} then calls this again with false.
+     */
+    private void startConnect(final boolean allowAsk) {
+        new Thread(() -> {
+            final MagicV2Ray.Info info = MagicV2Ray.info(getApplicationContext());
+            magic = info;
+            MagicV2Ray.ActiveNode node = null;
+            if (info.apiLevel >= 2 && info.has(MagicV2Ray.FEATURE_NODES)) {
+                node = MagicV2Ray.activeNode(getApplicationContext());
+                if (node.permissionRequired() && allowAsk) {
+                    Log.add("Magic V2Ray asks you to allow this app to read your nodes");
+                    ui.post(() -> {
+                        if (state != State.CONNECTING) return;
+                        if (!MagicV2Ray.requestNodeAccess(this, REQ_NODE_ACCESS)) startConnect(false);
+                    });
+                    return;
+                }
+                if (!node.ok()) Log.add("cannot read the node in use (" + node.status + ")");
+            } else {
+                Log.add("Magic V2Ray API level " + info.apiLevel + " (< 2): no node choice");
+            }
+            connectWith(info, node != null && node.ok() ? node : null);
+        }, "magic-node").start();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_NODE_ACCESS || state != State.CONNECTING) return;
+        boolean granted = resultCode == RESULT_OK && data != null && data.getBooleanExtra("granted", true);
+        Log.add(granted ? "node access granted" : "node access refused");
+        startConnect(false);                    // granted: reads the node; refused: connects without it
+    }
+
+    /** Step 2 (background thread): choose the node and the overrides for the mode, then send the request. */
+    private void connectWith(MagicV2Ray.Info info, MagicV2Ray.ActiveNode node) {
+        final boolean level2 = info.apiLevel >= 2;
+        if (settings.mode == WarpOverrides.MODE_WARP) {
+            connectWarp(node);
+        } else if (level2) {
+            // DNS only, no local proxy: the node in use keeps carrying the traffic, else freedom://localhost
+            final String uri = node != null ? NodePicker.pick(node.connected, node.source, node.uri)
+                    : NodePicker.fallback(info.stateKnown, info.connected, info.sessionActive);
+            final String overrides = WarpOverrides.json(settings, false);
+            Log.add("mode 1.1.1.1, node " + (uri == null ? "(the selected node)" : uri) + ", overrides " + overrides);
+            ui.post(() -> {
+                if (state != State.CONNECTING) return;
+                if (!MagicV2Ray.connectByIntent(this, uri, SESSION_NAME, overrides)) fail("Could not open Magic V2Ray");
+                else pollState(0);
+            });
+        } else {
+            final String overrides = WarpOverrides.json(settings);
+            Log.add("mode 1.1.1.1 (bridge), overrides " + overrides);
+            ui.post(() -> connectBridge(overrides));
+        }
     }
 
     /** Magic V2Ray (or a version with the connect API) is missing: ask the user to download it from MAGIC_URL. */
@@ -214,23 +286,86 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** WARP: get the WireGuard configuration (registers this device the first time), then connect with its link. */
-    private void connectWarp(final String overrides) {
+    /** WARP (background thread): the WireGuard link (registers this device the first time), chained with the node in use. */
+    private void connectWarp(MagicV2Ray.ActiveNode node) {
+        try {
+            WarpAccount a = ensureAccount();
+            final String link = WireGuardUri.build(a, SESSION_NAME);
+            String user = null;
+            if (settings.chainUserNode && node != null) {
+                user = NodePicker.chainable(node.connected, node.source, node.uri, node.protocol);
+                Log.add(user != null ? "chain with " + node.source + " node \"" + node.name + "\" -> " + user
+                        : "node in use cannot be chained (" + (node.connected ? node.source + " " + node.protocol : "not connected") + "): WARP alone");
+            } else if (settings.chainUserNode) {
+                Log.add("node in use unknown (no access): WARP alone");
+            }
+            final String uri = user == null ? link : ChainUri.build(link, user, settings.chainWarpFirst);
+            chainedWith = user == null ? null : (node.name.isEmpty() ? "your node" : node.name);
+            chainedUserUri = user;
+            chainWarpFirst = settings.chainWarpFirst;
+            if (user != null) store.saveChain(user, chainedWith, chainWarpFirst);
+            else store.clearChain();
+            final String overrides = WarpOverrides.json(settings);
+            Log.add("mode WARP" + (user == null ? "" : " + chain") + ", WireGuard " + a.host + ":" + a.port + ", overrides " + overrides);
+            ui.post(() -> {
+                if (state != State.CONNECTING) return;
+                if (!MagicV2Ray.connectByIntent(this, uri, SESSION_NAME, overrides)) fail("Could not open Magic V2Ray");
+                else pollState(0);
+            });
+        } catch (IOException e) {
+            Log.add("config error: " + e.getMessage());
+            ui.post(() -> fail(e.getMessage()));
+        }
+    }
+
+    /** True while WARP is connected and chained with a node of the user's, so the chain can be reversed. */
+    private boolean canReverse() {
+        return state == State.ON && settings.mode == WarpOverrides.MODE_WARP
+                && chainedWith != null && chainedUserUri != null;
+    }
+
+    private void restoreChain() {
+        String uri = store.chainUri();
+        if (uri == null) return;
+        chainedUserUri = uri;
+        chainedWith = store.chainName();
+        chainWarpFirst = store.chainWarpFirst();
+    }
+
+    /**
+     * Reverses the order of the running chain (WARP -> node becomes node -> WARP and the other way round) without
+     * the user disconnecting first. The user's node is no longer "in use" on its own (the session is our chain), so
+     * the uri kept from the first connect is used. Magic V2Ray replaces a running session by a new connect (one
+     * session at a time), so one request is enough; the user confirms it there like any other connect.
+     */
+    private void reverseChain() {
+        if (!canReverse()) return;
+        final String userUri = chainedUserUri;
+        final boolean warpFirst = !chainWarpFirst;
         new Thread(() -> {
             try {
                 WarpAccount a = ensureAccount();
-                final String link = WireGuardUri.build(a, SESSION_NAME);
-                Log.add("WireGuard " + a.host + ":" + a.port);
+                final String uri = ChainUri.build(WireGuardUri.build(a, SESSION_NAME), userUri, warpFirst);
+                final String overrides = WarpOverrides.json(settings);
+                Log.add("reverse chain -> " + (warpFirst ? "WARP first" : "node first") + ", overrides " + overrides);
                 ui.post(() -> {
-                    if (state != State.CONNECTING) return;
-                    if (!MagicV2Ray.connectByIntent(this, link, SESSION_NAME, overrides)) fail("Could not open Magic V2Ray");
-                    else pollState(0);
+                    if (state != State.ON) return;
+                    if (!MagicV2Ray.connectByIntent(this, uri, SESSION_NAME, overrides)) {
+                        Toast.makeText(this, "Could not open Magic V2Ray", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    chainWarpFirst = warpFirst;
+                    settings.chainWarpFirst = warpFirst;
+                    store.saveSettings(settings);
+                    store.saveChain(userUri, chainedWith, warpFirst);
+                    render();
+                    pollState(0);
                 });
             } catch (IOException e) {
-                Log.add("config error: " + e.getMessage());
-                ui.post(() -> fail(e.getMessage()));
+                Log.add("reverse chain error: " + e.getMessage());
+                ui.post(() -> Toast.makeText(this, e.getMessage(), Toast.LENGTH_SHORT).show());
             }
-        }, "warp-config").start();
+        }, "warp-reverse").start();
     }
 
     /** Order matters: the bridge keeps running until Magic V2Ray has let go of it. */
@@ -361,6 +496,16 @@ public class MainActivity extends Activity {
         sl.setGravity(Gravity.CENTER);
         sl.setPadding(0, u.dp(8), 0, 0);
         mid.addView(sl, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        if (canReverse()) {
+            TextView rev = u.tv("⇄  Reverse chain: " + (chainWarpFirst ? "WARP → " + chainedWith : chainedWith + " → WARP"), 14, u.text, false);
+            rev.setGravity(Gravity.CENTER);
+            rev.setPadding(u.dp(18), u.dp(10), u.dp(18), u.dp(10));
+            rev.setBackground(u.rounded(u.surface, 22, 22));
+            rev.setOnClickListener(v -> reverseChain());
+            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rp.topMargin = u.dp(16);
+            mid.addView(rev, rp);
+        }
         page.addView(mid, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         // details card: tap = DNS settings
@@ -369,7 +514,9 @@ public class MainActivity extends Activity {
         card.setBackground(u.rounded(u.surface, 22, 22));
         card.setElevation(u.dp(2));
         card.setPadding(u.dp(18), u.dp(4), u.dp(18), u.dp(4));
-        card.addView(infoRow("Mode", warp ? "WARP · WireGuard" : "1.1.1.1 · SOCKS5 bridge", true));
+        card.addView(infoRow("Mode", !warp ? "1.1.1.1 · DNS only"
+                : chainedWith == null ? "WARP · WireGuard"
+                : chainWarpFirst ? "WARP → " + chainedWith : chainedWith + " → WARP", true));
         card.addView(infoRow("DNS", WarpOverrides.dnsLabel(settings), true));
         card.addView(infoRow("Filter", WarpOverrides.familiesLabel(settings.families), false));
         card.setOnClickListener(v -> go("dns"));
@@ -446,9 +593,9 @@ public class MainActivity extends Activity {
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         body.addView(u.gap(8));
-        body.addView(u.choiceRow("1.1.1.1", "DNS only. A local SOCKS5 bridge intercepts every DNS query (any:53) and resolves it over HTTPS (DoH). Your traffic is not tunnelled.",
+        body.addView(u.choiceRow("1.1.1.1", "DNS only. Every DNS query is resolved over HTTPS (DoH); your node (or no proxy) keeps carrying the traffic. A Magic V2Ray older than API level 2 gets a local SOCKS5 bridge instead.",
                 settings.mode == WarpOverrides.MODE_1111, () -> chooseMode(WarpOverrides.MODE_1111)));
-        body.addView(u.choiceRow("WARP", "Everything from 1.1.1.1 plus a WireGuard tunnel to Cloudflare WARP for the whole device.",
+        body.addView(u.choiceRow("WARP", "Everything from 1.1.1.1 plus a WireGuard tunnel to Cloudflare WARP for the whole device. If Magic V2Ray is connected through a node of yours, WARP is chained with it.",
                 settings.mode == WarpOverrides.MODE_WARP, () -> chooseMode(WarpOverrides.MODE_WARP)));
         body.addView(u.gap(16));
         body.addView(u.row("Account", null, null, () -> go("account")));
@@ -552,6 +699,14 @@ public class MainActivity extends Activity {
                     settings.fallbackResolvers = on;
                     store.saveSettings(settings);
                 }),
+                u.switchRow("Chain WARP with my node", settings.chainUserNode, on -> {
+                    settings.chainUserNode = on;
+                    store.saveSettings(settings);
+                }),
+                u.row("Chain order", "WARP mode, when a node of yours is in use.",
+                        settings.chainWarpFirst ? "WARP → your node" : "Your node → WARP",
+                        () -> pick("Chain order", new String[]{"Your node first, then WARP (default)", "WARP first, then your node"},
+                                settings.chainWarpFirst ? 1 : 0, i -> settings.chainWarpFirst = i == 1)),
                 u.row("Tunnel protocol", null, "WireGuard", null),
                 u.row("Reset security keys", null, null, this::resetKeys),
                 u.row("Reset all settings", null, null, this::resetAll));
@@ -592,7 +747,7 @@ public class MainActivity extends Activity {
         final boolean bridge = settings.mode == WarpOverrides.MODE_1111;
         int eff = settings.effectiveProtocol();
         String protoSub;
-        if (bridge) protoSub = "1.1.1.1 mode: DNS (any:53) is intercepted by the local SOCKS5 bridge and resolved over HTTPS.";
+        if (bridge) protoSub = "1.1.1.1 mode: DNS is resolved over HTTPS.";
         else if (eff == WarpOverrides.PROTO_DOH) protoSub = "DNS is hijacked and resolved by Cloudflare's DoH endpoint.";
         else protoSub = "Every DNS query (any:53) is rewritten to " + WarpOverrides.firstIp(settings.families) + ":53 and sent through the WARP tunnel.";
 
@@ -749,8 +904,9 @@ public class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         sb.append(m == null ? "Magic V2Ray: checking…" : m.summary()).append('\n');
         sb.append("State: ").append(state).append('\n');
-        sb.append("Mode: ").append(settings.mode == WarpOverrides.MODE_WARP ? "WARP" : "1.1.1.1 (DNS bridge)").append('\n');
+        sb.append("Mode: ").append(settings.mode == WarpOverrides.MODE_WARP ? "WARP" : "1.1.1.1 (DNS only)").append('\n');
         sb.append("DNS: ").append(WarpOverrides.dnsLabel(settings)).append('\n');
+        sb.append("Chain: ").append(settings.chainUserNode ? (chainedWith == null ? "on, not chained" : "WARP + " + chainedWith) : "off").append('\n');
         sb.append("Bridge: ").append(Socks5Service.listening ? "listening on 127.0.0.1:" + WarpOverrides.SOCKS_PORT : "stopped").append('\n');
         sb.append("Always on: FakeDNS off, UseIP, IPv6\n");
         if (a != null) {

@@ -19,7 +19,7 @@ import org.json.JSONObject;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Client side of the Magic V2Ray external API (taken from the magic-dns-rewrite example, connect() generalised).
+ * Client side of the Magic V2Ray external API (level 2), taken from the Magic V2Ray API example (connect() generalised).
  * (Everything an AI assistant or another developer needs to call the API is described here.)
  *
  * <h2>What Magic V2Ray offers</h2>
@@ -34,6 +34,9 @@ import java.nio.charset.StandardCharsets;
  *  4. Am I connected?      ContentProvider call "getState"                          no
  *  5. Tell me on change    broadcast  com.huskydg.magicv2ray.event.STATE_CHANGED    no
  *                          (we listen with {@link #listen})
+ *  6. Which node is in     ContentProvider call "getActiveNode" (API level 2)       first time: the user
+ *     use?                 + startActivityForResult REQUEST_NODE_ACCESS             grants access
+ *  7. Special connect uris freedom://localhost, nodeid://&lt;id&gt;, chain://...  (API level 2)
  * </pre>
  *
  * <h2>The rules you must know</h2>
@@ -43,36 +46,42 @@ import java.nio.charset.StandardCharsets;
  *       behaves as if Magic V2Ray were not installed.</li>
  *   <li><b>A connect is only a request.</b> The user always confirms it. The server of an external session is
  *       temporary: the user's own nodes and settings are never changed.</li>
- *   <li><b>API level.</b> Info and state events exist from API level 1 ({@link Info#apiLevel}). An older Magic V2Ray
- *       has no provider: {@link #info} then reports {@code apiLevel == 0}. Test {@link Info#has(String)} for a
- *       feature, never the app's version number.</li>
- *   <li><b>Never call {@link #info} / {@link #state} on the main thread.</b> In root mode Magic V2Ray may have to
- *       ask the root service (up to a few seconds).</li>
+ *   <li><b>API level.</b> Info and state events exist from API level 1, nodes and the special uris from level 2
+ *       ({@link Info#apiLevel}). An older Magic V2Ray has no provider: {@link #info} then reports
+ *       {@code apiLevel == 0}. Test {@link Info#has(String)} for a feature, never the app's version number.</li>
+ *   <li><b>Never call {@link #info} / {@link #state} / {@link #activeNode} on the main thread.</b> In root mode
+ *       Magic V2Ray may have to ask the root service (up to a few seconds).</li>
  *   <li><b>Events can arrive twice</b> (once as a normal broadcast, once addressed to your package). {@link #listen}
  *       removes the duplicates for you; do the same if you write your own receiver (key: {@code seq + time}).</li>
  *   <li><b>No event if Magic V2Ray itself is killed</b> (non-root mode: the VPN dies with it). If that matters,
  *       also call {@link #state} now and then.</li>
- *   <li>The data carries no server address and no settings, only the state.</li>
+ *   <li>The data carries no server address and no settings, only the state. Nodes are readable only after the user
+ *       allowed this app; the default level ("anonymous") hands out {@code nodeid://<id>} instead of the real link.</li>
  * </ol>
  *
  * <h2>Connect: two ways, same result</h2>
  * <ul>
  *   <li>explicit intent ({@link #connectByIntent}): Android tells Magic V2Ray which app asked, so the user may choose
- *       "Always trust this app". That also makes Magic V2Ray send the state events straight to this app's package;</li>
- *   <li>deep link ({@link #connectByLink}): works for websites too, but is always confirmed and the caller is unknown.</li>
+ *       "Always trust this app". That also makes Magic V2Ray send the state events straight to this app's package, and
+ *       it is the only way to use {@code nodeid://};</li>
+ *   <li>deep link ({@link #connectByLink}): works for websites too, but is always confirmed, the caller is unknown
+ *       and {@code nodeid://} is refused (a uri that contains one is not sent).</li>
  * </ul>
  * Both carry {@link WarpOverrides#json} as {@code overrides} (DNS servers, excluded apps / routes). A request with
  * overrides is always confirmed by the user in Magic V2Ray.
  *
- * <h2>Typical flow of an app (this example does exactly this)</h2>
+ * <h2>Typical flow of this app (MainActivity)</h2>
  * <pre>
- *  1. new Thread(() -> info = MagicV2Ray.info(ctx)).start();      // installed? version? apiLevel &gt;= 1?
- *  2. start your local proxy, wait until its port is open
- *  3. MagicV2Ray.connectByIntent(activity, uri, name);             // user confirms
- *  4. receiver = MagicV2Ray.listen(service, event -&gt; { ... });    // ALIVE as long as your proxy runs
- *       event.connected == false &amp;&amp; event.session            // our session ended -&gt; stop our proxy
- *  5. to stop yourself: MagicV2Ray.disconnect(activity), THEN stop the proxy
- *  6. MagicV2Ray.unlisten(service, receiver);
+ *  1. new Thread(() -> info = MagicV2Ray.info(ctx)).start();      // installed? version? apiLevel &gt;= 2?
+ *  2. node = MagicV2Ray.activeNode(ctx)                            // status "permission_required"?
+ *       -&gt; MagicV2Ray.requestNodeAccess(activity, CODE), wait for onActivityResult, ask again
+ *  3. WARP:    NodePicker.chainable(...) != null -&gt; ChainUri.build(wireguard link, node uri)   else the link alone
+ *     1.1.1.1: NodePicker.pick(...) (the node in use, else freedom://localhost); no local proxy needed
+ *  4. MagicV2Ray.connectByIntent(activity, uri, name, overrides);   // user confirms
+ *  5. receiver = MagicV2Ray.listen(context, event -&gt; { ... });    // event.connected == false -&gt; it ended
+ *  6. to stop yourself: MagicV2Ray.disconnect(activity)
+ *  7. MagicV2Ray.unlisten(context, receiver);
+ *  (Magic V2Ray older than level 2: no node choice; the 1.1.1.1 mode falls back to its local SOCKS5 bridge.)
  * </pre>
  */
 final class MagicV2Ray {
@@ -97,12 +106,21 @@ final class MagicV2Ray {
     /** provider.call(): only the state. Bundle: json, connected, known, mode. */
     static final String METHOD_STATE = "getState";
 
+    /** provider.call() (API level 2): the node in use. Bundle: status, level, json, connected, source. Needs the user's permission. */
+    static final String METHOD_ACTIVE_NODE = "getActiveNode";
+    /** Activity action (API level 2): asks the user to let this app read nodes. Start it with startActivityForResult. */
+    static final String ACTION_REQUEST_NODE_ACCESS = "com.huskydg.magicv2ray.action.REQUEST_NODE_ACCESS";
+
     /** Broadcast sent on every connect / disconnect, see {@link StateEvent}. */
     static final String EVENT_STATE_CHANGED = "com.huskydg.magicv2ray.event.STATE_CHANGED";
 
     /** Feature names found in {@code api.features} of the info JSON. */
     static final String FEATURE_INFO = "info";
     static final String FEATURE_STATE_EVENTS = "state_events";
+    static final String FEATURE_NODES = "nodes";
+    static final String FEATURE_NODE_ACCESS_REQUEST = "node_access_request";
+    static final String FEATURE_CONNECT_FREEDOM = "connect_freedom";
+    static final String FEATURE_CONNECT_NODEID = "connect_nodeid";
 
     private MagicV2Ray() {
     }
@@ -214,6 +232,74 @@ final class MagicV2Ray {
         }
     }
 
+    // ------------------------------------------------------------------ 6. the node in use (API level 2)
+
+    /** What {@link #activeNode} learned. */
+    static final class ActiveNode {
+        /** "ok", "permission_required", "unknown_caller", "unavailable", or "unsupported" (Magic V2Ray older than level 2 / not installed). */
+        String status = "unsupported";
+        /** Only meaningful when {@code status == "ok"}. */
+        boolean connected;
+        /** "session" (an app set it for a while), "selected" (the user's own pick) or "direct" (the built-in no-proxy node). */
+        String source = "";
+        /** {@code nodeid://<id>} at the anonymous level, the real link at the full level, {@code freedom://localhost} for direct. */
+        String uri = "";
+        String name = "";
+        /** Protocol of the node (vless, wireguard, chain ...), "" when Magic V2Ray does not say. */
+        String protocol = "";
+
+        boolean ok() {
+            return "ok".equals(status);
+        }
+
+        boolean permissionRequired() {
+            return "permission_required".equals(status);
+        }
+    }
+
+    /**
+     * Asks which node Magic V2Ray is using ({@link #METHOD_ACTIVE_NODE}). BLOCKS: background thread only.
+     * Never returns null and never throws. When {@code status} is {@code permission_required}, call
+     * {@link #requestNodeAccess} from an Activity and ask again after it returned RESULT_OK.
+     */
+    static ActiveNode activeNode(Context c) {
+        ActiveNode out = new ActiveNode();
+        Bundle b = callProvider(c, METHOD_ACTIVE_NODE);
+        if (b == null) return out;                      // no provider / older than API level 2
+        String status = b.getString("status");
+        if (status == null) return out;                 // a level-1 provider answers an unknown method with null
+        out.status = status;
+        if (!out.ok()) return out;
+        try {
+            JSONObject j = new JSONObject(b.getString("json", "{}"));
+            out.connected = j.optBoolean("connected");
+            out.source = j.optString("source");
+            JSONObject n = j.optJSONObject("node");
+            if (n != null) {
+                out.uri = n.optString("uri");
+                out.name = n.optString("name");
+                out.protocol = n.optString("protocol");
+            }
+        } catch (Exception e) {
+            out.status = "unavailable";
+        }
+        return out;
+    }
+
+    /**
+     * Opens Magic V2Ray's permission dialog (anonymous info by default). It MUST be startActivityForResult: that is
+     * how Magic V2Ray learns who is asking. The result is RESULT_OK when granted; extras: granted, level, persistent.
+     * We ask for the anonymous level on purpose: {@code nodeid://<id>} is enough to connect, no credentials needed.
+     */
+    static boolean requestNodeAccess(Activity a, int requestCode) {
+        try {
+            a.startActivityForResult(new Intent(ACTION_REQUEST_NODE_ACCESS).setPackage(PKG), requestCode);
+            return true;
+        } catch (ActivityNotFoundException e) {
+            return false;
+        }
+    }
+
     // ------------------------------------------------------------------ 5. state events
 
     /**
@@ -321,8 +407,9 @@ final class MagicV2Ray {
 
     /**
      * Connect with an explicit intent. Magic V2Ray shows a confirmation, then routes the device through {@code uri}.
-     * @param uri       node to use (here a wireguard:// link); {@code null} = keep the node the user selected in
-     *                  Magic V2Ray and only apply {@code overrides} (DNS-only mode)
+     * @param uri       node to use: a wireguard:// link, a {@code chain://} of it and the user's node, {@code nodeid://<id>},
+     *                  {@link NodePicker#FREEDOM}; {@code null} = keep the node the user selected in Magic V2Ray and
+     *                  only apply {@code overrides}
      * @param name      label shown in Magic V2Ray (status chip, notification) and reported back as {@code sessionName}
      * @param overrides temporary settings as JSON text, see {@link WarpOverrides#json}
      */
@@ -354,8 +441,16 @@ final class MagicV2Ray {
                 .appendQueryParameter("overrides", Base64.encodeToString(
                         overrides.getBytes(StandardCharsets.UTF_8),
                         Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING));
-        if (uri != null) b.appendQueryParameter("uri", uri);   // appendQueryParameter URL-encodes the value
+        // nodeid:// (alone or as a hop) is refused for a link: the caller is unknown. The value is URL-encoded.
+        if (uri != null && usableInLink(uri)) b.appendQueryParameter("uri", uri);
         return start(a, new Intent(Intent.ACTION_VIEW, b.build()).setPackage(PKG));
+    }
+
+    /** A deep link can never carry {@code nodeid://} (alone or as a hop): Magic V2Ray refuses it, the caller is unknown. */
+    static boolean usableInLink(String uri) {
+        if (uri == null) return false;
+        String u = uri.toLowerCase(java.util.Locale.ROOT);
+        return !u.contains("nodeid://") && !u.contains("nodeid%3a%2f%2f");
     }
 
     // ------------------------------------------------------------------ 2. disconnect

@@ -10,12 +10,19 @@ import java.util.regex.Pattern;
  *
  * <h2>Two modes</h2>
  * <pre>
- *  1.1.1.1  node = socks://127.0.0.1:5353 (our local bridge, see Socks5Server)
+ *  1.1.1.1  Magic V2Ray API level 2 (default, {@link #json(Settings, boolean) bridge = false}):
+ *           node = the node in use, else freedom://localhost; no local proxy at all
+ *           traffic.hijackDns = true           Xray answers the DNS queries, over HTTPS (https://1.1.1.1/dns-query, by IP)
+ *           your routing rules stay in force
+ *
+ *  1.1.1.1  older Magic V2Ray (bridge = true):
+ *           node = socks://127.0.0.1:5353 (our local bridge, see Socks5Server)
  *           traffic.hijackDns = false          every DNS query stays an ordinary port-53 packet and reaches the bridge
  *           routing (replace)                  port 53 -> proxy (the bridge), everything else -> direct
  *           the bridge answers each query by asking Cloudflare over HTTPS (DoH); this app is kept out of the VPN
  *
- *  WARP     node = wireguard://... (Cloudflare WARP, see WireGuardUri)
+ *  WARP     node = wireguard://... (Cloudflare WARP, see WireGuardUri), or, when a node of the user is in use,
+ *           chain://... with it (see ChainUri, NodePicker.chainable)
  *           traffic.hijackDns = true           Xray answers the DNS queries
  *           DNS over WARP   foreignDns 1.1.1.1 (or .2 / .3), dnsViaProxy = true
  *                           = every any:53 query is rewritten to 1.1.1.1:53 and sent through the proxy outbound
@@ -50,6 +57,10 @@ final class WarpOverrides {
         int families = FAMILIES_NONE;
         int dnsProtocol = PROTO_WARP;            // only used in WARP mode
         boolean fallbackResolvers = true;
+        /** WARP mode: chain WARP with the node Magic V2Ray is using (API level 2), when there is one. */
+        boolean chainUserNode = true;
+        /** Chain order: false (default) = device -> your node -> WARP, true = device -> WARP -> your node. */
+        boolean chainWarpFirst = false;
         final List<String> excludedApps = new ArrayList<>();
         final List<String> excludedRoutes = new ArrayList<>();
 
@@ -130,18 +141,31 @@ final class WarpOverrides {
 
     // ------------------------------------------------------------------ the JSON
 
-    /** The overrides JSON text (never null: the always-on settings are part of it). */
+    /** The overrides JSON text with the local bridge for the 1.1.1.1 mode (Magic V2Ray older than API level 2). */
     static String json(Settings s) {
+        return json(s, true);
+    }
+
+    /**
+     * The overrides JSON text (never null: the always-on settings are part of it).
+     *
+     * @param bridge only for the 1.1.1.1 mode: true = the local SOCKS5 bridge answers port 53 (old Magic V2Ray),
+     *               false = Magic V2Ray API level 2: Xray's own DNS module resolves over HTTPS, no local proxy
+     */
+    static String json(Settings s, boolean bridge) {
         boolean warp = s.mode == MODE_WARP;
+        boolean hijack = warp || !bridge;
         boolean doh = s.effectiveProtocol() == PROTO_DOH;
 
         StringBuilder sb = new StringBuilder("{\"traffic\":{");
-        sb.append("\"hijackDns\":").append(warp)
+        sb.append("\"hijackDns\":").append(hijack)
                 .append(",\"fakeDnsLocal\":false")
                 .append(",\"queryStrategy\":\"UseIP\"");
-        if (warp) {
+        if (hijack) {
             if (doh) {
-                String url = str(dohUrl(s.families));
+                // WARP: by host name (the tunnel or the node resolves it); 1.1.1.1 mode: by IP (the certificate has IP
+                // SANs), so there is nothing to resolve before the first query can be answered.
+                String url = str(warp ? dohUrl(s.families) : dohFallbackUrl(s.families));
                 sb.append(",\"foreignDns\":").append(url).append(",\"directDns\":").append(url)
                         .append(",\"dnsViaProxy\":false");
             } else {
@@ -159,7 +183,7 @@ final class WarpOverrides {
             sb.append("]}");
         }
 
-        if (!warp) {
+        if (!warp && bridge) {
             // 1.1.1.1 mode: only port 53 goes to the bridge, everything else leaves the VPN as direct.
             // "else" takes two rules: Magic V2Ray drops a rule with no match condition, and an ip rule never matches
             // a destination that still has a domain name.
@@ -168,7 +192,7 @@ final class WarpOverrides {
                     .append("{\"remarks\":\"else direct (ip)\",\"ip\":\"0.0.0.0/0,::/0\",\"outboundTag\":\"direct\"},")
                     .append("{\"remarks\":\"else direct (domain)\",\"domain\":\"regexp:.+\",\"outboundTag\":\"direct\"}")
                     .append("]}");
-        } else {
+        } else if (warp) {
             List<String> routes = new ArrayList<>();
             for (String r : s.excludedRoutes) if (validRoute(r) && routes.size() < 500) routes.add(r);
             if (!routes.isEmpty()) {
